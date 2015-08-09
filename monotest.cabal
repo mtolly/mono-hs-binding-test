@@ -1,0 +1,14 @@
+name:                 monotest
+version:              0.1.0.0
+build-type:           Simple
+cabal-version:        >= 1.10
+
+executable monotest
+  hs-source-dirs:       app
+  main-is:              Main.hs
+  other-modules:        Mono
+  ghc-options:          -Wall
+  build-depends:        base
+  default-language:     Haskell2010
+  pkgconfig-depends:    mono-2, glib-2.0
+  build-tools:          c2hs
