@@ -1,13 +1,17 @@
 {-# LANGUAGE LambdaCase #-}
 module Mono where
 
-import Foreign
+import Foreign hiding (void)
 import Foreign.C
 import Control.Monad
+import Control.Monad.Fix (fix)
+import Control.Exception (bracket)
+import Data.List (intercalate)
 
 #include <glib.h>
 #include <mono/jit/jit.h>
 #include <mono/metadata/assembly.h>
+#include <mono/metadata/debug-helpers.h>
 
 data MonoDomain_
 {#pointer *MonoDomain -> `MonoDomain_' #}
@@ -27,6 +31,10 @@ data MonoGenericContext_
 {#pointer *MonoGenericContext -> `MonoGenericContext_' #}
 data MonoGenericParam_
 {#pointer *MonoGenericParam -> `MonoGenericParam_' #}
+data MonoMethodSignature_
+{#pointer *MonoMethodSignature -> `MonoMethodSignature_' #}
+data MonoString_
+{#pointer *MonoString -> `MonoString_' #}
 
 {#enum MonoTypeEnum {} deriving (Eq, Ord, Show, Read) #}
 
@@ -136,6 +144,26 @@ data MonoEvent_
 {#fun mono_method_can_access_field {`MonoMethod', `MonoClassField'} -> `Bool' #}
 {#fun mono_method_can_access_method {`MonoMethod', `MonoMethod'} -> `Bool' #}
 
+-- debug-helpers.h (without disassembly stuff)
+
+data MonoMethodDesc_
+{#pointer *MonoMethodDesc -> `MonoMethodDesc_' #}
+
+{#fun mono_type_full_name {`MonoType'} -> `String' #}
+{#fun mono_signature_get_desc {`MonoMethodSignature', `Bool'} -> `String' #}
+{#fun mono_context_get_desc {`MonoGenericContext'} -> `String' #}
+
+{#fun mono_method_desc_new {`String', `Bool'} -> `MonoMethodDesc' #}
+{#fun mono_method_desc_from_method {`MonoMethod'} -> `MonoMethodDesc' #}
+{#fun mono_method_desc_free {`MonoMethodDesc'} -> `()' #}
+{#fun mono_method_desc_match {`MonoMethodDesc', `MonoMethod'} -> `Bool' #}
+{#fun mono_method_desc_full_match {`MonoMethodDesc', `MonoMethod'} -> `Bool' #}
+{#fun mono_method_desc_search_in_class {`MonoMethodDesc', `MonoClass'} -> `MonoMethod' #}
+{#fun mono_method_desc_search_in_image {`MonoMethodDesc', `MonoImage'} -> `MonoMethod' #}
+
+{#fun mono_method_full_name {`MonoMethod', `Bool'} -> `String' #}
+{#fun mono_field_full_name {`MonoClassField'} -> `String' #}
+
 -- assorted
 
 {#fun mono_jit_init {`String'} -> `MonoDomain' #}
@@ -152,93 +180,169 @@ data MonoEvent_
 {#fun mono_object_get_class {`MonoObject'} -> `MonoClass' #}
 {#fun mono_type_get_type {`MonoType'} -> `MonoTypeEnum' #}
 {#fun mono_domain_get {} -> `MonoDomain' #}
-
-printClassField :: MonoClassField -> IO ()
-printClassField mcf = do
-  let p s f = f mcf >>= \x -> putStrLn $ s ++ ": " ++ show x
-  p "name" mono_field_get_name
-  p "type" mono_field_get_type
-  p "parent" mono_field_get_parent
-  p "flags" mono_field_get_flags
-  p "offset" mono_field_get_offset
-  p "data" mono_field_get_data
-  putStrLn ""
+{#fun mono_runtime_invoke {`MonoMethod', `Ptr ()', id `Ptr (Ptr ())', id `Ptr MonoObject'} -> `MonoObject' #}
+{#fun mono_string_new {`MonoDomain', `String'} -> `MonoString' #}
+{#fun mono_method_signature {`MonoMethod'} -> `MonoMethodSignature' #}
+{#fun mono_signature_get_params {`MonoMethodSignature', id `Iter'} -> `MonoType' #}
 
 iteration :: (Iter -> IO (Ptr a)) -> IO [Ptr a]
 iteration f = alloca $ \iter -> do
   poke iter nullPtr
-  let loop = do
-        p <- f iter
-        if p == nullPtr
-          then return []
-          else fmap (p :) loop
-  loop
-
-findField :: MonoClass -> String -> IO MonoClassField
-findField c f = do
-  fields <- iteration $ mono_class_get_fields c
-  pairs <- forM fields $ \field -> do
-    name <- mono_field_get_name field
-    return (name, field)
-  case lookup f pairs of
-    Nothing -> error $ "no field named " ++ show f
-    Just field -> return field
-
-data Value
-  = Object MonoObject
-  | UInt32 Word32
-  deriving (Eq, Ord, Show)
-
-getField :: MonoObject -> String -> IO Value
-getField obj f = do
-  klass <- mono_object_get_class obj
-  field <- findField klass f
-  mono_field_get_type field >>= mono_type_get_type >>= \case
-    MONO_TYPE_U4 -> alloca $ \p -> do
-      mono_field_get_value obj field $ castPtr p
-      fmap UInt32 $ peek p
-    _ -> do
-      dom <- mono_domain_get
-      fmap Object $ mono_field_get_value_object dom field obj
-
-setField :: MonoObject -> String -> Value -> IO ()
-setField obj f v = do
-  klass <- mono_object_get_class obj
-  field <- findField klass f
-  mono_field_get_type field >>= mono_type_get_type >>= \case
-    MONO_TYPE_U4 -> case v of
-      UInt32 u32 -> alloca $ \p -> do
-        poke p u32
-        mono_field_set_value obj field $ castPtr p
-      _ -> wrongType
-    _ -> case v of
-      Object o -> mono_field_set_value obj field $ castPtr o
-      _ -> wrongType
-  where wrongType = error "setField: incorrect type"
+  fix $ \loop -> do
+    p <- f iter
+    if p == nullPtr
+      then return []
+      else fmap (p :) loop
 
 check :: IO (Ptr a) -> IO (Ptr a)
-check = throwIfNull "something"
+check = throwIfNull "got a null pointer"
+
+runtimeInvoke :: MonoMethod -> Ptr () -> [Ptr ()] -> IO (Either MonoObject MonoObject)
+runtimeInvoke meth this params =
+  withArray0 nullPtr params $ \ary -> do -- don't know if the null term is necessary
+    alloca $ \pex -> do
+      poke pex nullPtr
+      ret <- mono_runtime_invoke meth this ary pex
+      exception <- peek pex
+      return $ if exception == nullPtr
+        then Right ret
+        else Left exception
+
+data Thing
+  = Object MonoObject
+  | Int32 Int32
+  | UInt32 Word32
+  | String String
+  deriving (Eq, Ord, Show)
+
+getField :: MonoClassField -> MonoObject -> MonoDomain -> IO Thing
+getField field obj dom = mono_field_get_type field >>= mono_type_get_type >>= \case
+  MONO_TYPE_U4 -> alloca $ \p -> do
+    mono_field_get_value obj field $ castPtr p
+    fmap UInt32 $ peek p
+  MONO_TYPE_I4 -> alloca $ \p -> do
+    mono_field_get_value obj field $ castPtr p
+    fmap Int32 $ peek p
+  MONO_TYPE_STRING -> undefined
+  _ -> fmap Object $ mono_field_get_value_object dom field obj
+
+setField :: MonoClassField -> MonoObject -> Thing -> IO ()
+setField field obj thing = mono_field_get_type field >>= mono_type_get_type >>= \case
+  MONO_TYPE_U4 -> case thing of
+    UInt32 w32 -> with w32 $ mono_field_set_value obj field . castPtr
+    _ -> wrongType
+  MONO_TYPE_I4 -> case thing of
+    Int32 i32 -> with i32 $ mono_field_set_value obj field . castPtr
+    _ -> wrongType
+  MONO_TYPE_STRING -> undefined
+  _ -> undefined
+  where wrongType = error "setField: wrong type"
+
+className :: MonoObject -> IO String
+className obj = do
+  klass <- mono_object_get_class    obj
+  c     <- mono_class_get_name      klass
+  ns    <- mono_class_get_namespace klass
+  return $ ns ++ "." ++ c
+
+thingClassName :: Thing -> IO String
+thingClassName = \case
+  Object o -> className o
+  String _ -> return "string"
+  UInt32 _ -> return "UInt32"
+  Int32  _ -> return "Int32"
+
+findMethod :: String -> MonoObject -> [Thing] -> MonoImage -> IO MonoMethod
+findMethod name obj args img = do
+  objClass <- className obj
+  argClasses <- mapM thingClassName args
+  let descString = objClass ++ ":" ++ name ++ "(" ++ intercalate ", " argClasses ++ ")"
+      errstr = "No matching method for description: " ++ descString
+  throwIfNull errstr
+    $ bracket (check $ mono_method_desc_new descString True) mono_method_desc_free
+    $ \desc -> mono_method_desc_search_in_image desc img
+
+callMethod :: String -> MonoObject -> [Thing] -> MonoDomain -> MonoImage -> IO (Either MonoObject MonoObject)
+callMethod name obj args dom img = do
+  meth <- throwIfNull "No matching method found" $ findMethod name obj args img
+  sig <- mono_method_signature meth
+  paramTypes <- iteration $ mono_signature_get_params sig
+  when (length paramTypes /= length args) $ error "callMethod: panic! arg length doesn't match"
+  let withParam (ptype, thing) cont = case thing of
+        Object o   -> cont' o
+        String s   -> mono_string_new dom s >>= cont'
+        UInt32 w32 -> with w32 cont'
+        Int32  i32 -> with i32 cont'
+        where cont' = cont . castPtr
+  withMany withParam (zip paramTypes args) $ \ptrArgs -> do
+    withArray0 nullPtr ptrArgs $ \ptrPtr -> do
+      alloca $ \pex -> do
+        poke pex nullPtr
+        ret <- mono_runtime_invoke meth (castPtr obj) ptrPtr pex
+        exception <- peek pex
+        return $ if exception == nullPtr
+          then Right ret
+          else Left exception
 
 monoMain :: IO ()
-monoMain = do
-  dom <- check $ mono_jit_init "myapp"
+monoMain = bracket (check $ mono_jit_init "myapp") mono_jit_cleanup $ \dom -> do
   asm <- check $ mono_domain_assembly_open dom "X360.dll"
   img <- check $ mono_assembly_get_image asm
 
-  createSTFS <- check $ mono_class_from_name img "X360.STFS" "CreateSTFS"
-  xsession <- check $ mono_object_new dom createSTFS
-  mono_runtime_object_init xsession
+  let findField obj name = do
+        klass <- throwIfNull "couldn't get class of object" $ mono_object_get_class obj
+        throwIfNull ("couldn't find field " ++ name) $ mono_class_get_field_from_name klass name
 
-  Object header <- getField xsession "HeaderData"
-  setField header "TitleID" $ UInt32 0x45410914
+      findMethod_ description = check
+        $ bracket
+          (check $ mono_method_desc_new description True)
+          mono_method_desc_free
+        $ \desc -> mono_method_desc_search_in_image desc img
 
-  langs <- check $ mono_class_from_name img "X360.STFS" "Languages"
-  fs <- iteration $ mono_class_get_fields langs
-  mapM_ printClassField fs
-  alloca $ \p -> do
-    vtable <- mono_class_vtable dom langs
-    mono_field_static_get_value vtable (fs !! 3) $ castPtr p
-    i <- peek p :: IO Int32
-    print i
+      listMethods obj = do
+        meths <- mono_object_get_class obj >>= iteration . mono_class_get_methods
+        forM_ meths $ \m -> mono_method_full_name m True >>= putStrLn
 
-  mono_jit_cleanup dom
+      listFields obj = mono_object_get_class obj >>= listFieldsClass
+      listFieldsClass klass = do
+        fields <- iteration $ mono_class_get_fields klass
+        forM_ fields $ \f -> mono_field_full_name f >>= putStrLn
+
+      call desc obj args = do
+        meth <- findMethod_ desc
+        runtimeInvoke meth obj args >>= \case
+          Left exc -> error $ ".NET method returned an exception: " ++ show exc
+          Right ret -> return ret
+
+      enumValue namespace classname ident = do
+        klass <- check $ mono_class_from_name img namespace classname
+        field <- check $ mono_class_get_field_from_name klass ident
+        vtable <- check $ mono_class_vtable dom klass
+        alloca $ \p -> do
+          mono_field_static_get_value vtable field $ castPtr p
+          peek p
+
+  xsession <- do
+    klass <- check $ mono_class_from_name img "X360.STFS" "CreateSTFS"
+    xsession <- check $ mono_object_new dom klass
+    mono_runtime_object_init xsession
+    return xsession
+  Object header <- findField xsession "HeaderData" >>= \f -> getField f xsession dom
+  findField header "TitleID" >>= \f -> setField f header $ UInt32 0x45410914
+
+  do
+    klass <- check $ mono_class_from_name img "X360.STFS" "Languages"
+    field <- mono_class_get_field_from_name klass "English"
+    mono_field_get_type field >>= mono_type_get_type >>= print
+
+  do  v <- enumValue "X360.STFS" "Languages" "English"
+      Right _ <- callMethod "SetLanguage" header [Int32 v] dom img
+      return ()
+  Right _ <- callMethod "set_Publisher" header [String "Harmonix"] dom img
+  Right _ <- callMethod "set_Title_Package" header [String "Rock Band 3"] dom img
+  do  v <- enumValue "X360.STFS" "STFSType" "Type0"
+      void $ with (v :: Int32) $ \p -> 
+        call "X360.STFS.CreateSTFS:set_STFSType (X360.STFS.STFSType)" (castPtr xsession) [castPtr p]
+  do  v <- enumValue "X360.STFS" "PackageType" "SavedGame"
+      void $ with (v :: Int32) $ \p ->
+        call "X360.STFS.HeaderData:set_ThisType (X360.STFS.PackageType)" (castPtr header) [castPtr p]
